@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 echo "============================================"
-echo " ZIGGY AI - BOOTSTRAP COMPLET NOUVEAU POD"
+echo " ZIGGY AI - BOOTSTRAP COMPLET + WEB + OS"
 echo "============================================"
 
 # ---- 1. Ollama ----
@@ -39,20 +39,28 @@ else
   ollama pull qwen2.5:7b
 fi
 
-# ---- 3. Open WebUI ----
+# ---- 3. Outils IA Avancés (OS, Web, CrewAI) ----
+echo "📦 Installation Open Interpreter [OS], CrewAI, et outils Web..."
+pip install "open-interpreter[os]" crewai browser-use playwright duckduckgo-search --quiet --break-system-packages
+
+echo "🌐 Installation des navigateurs virtuels pour l'IA (Playwright)..."
+playwright install chromium --with-deps
+
+# ---- 4. Open WebUI (avec accès Internet) ----
 echo "📦 Installation Open WebUI..."
 pip install open-webui --quiet --break-system-packages
+
+# Activation de la recherche Web avec DuckDuckGo
 DATA_DIR=/workspace/openwebui-data \
 OLLAMA_BASE_URL=http://localhost:11434 \
+ENABLE_RAG_WEB_SEARCH=True \
+RAG_WEB_SEARCH_ENGINE="duckduckgo" \
 open-webui serve --host 0.0.0.0 --port 8080 \
   > /workspace/openwebui.log 2>&1 &
-echo "✅ Open WebUI → port 8080"
+echo "✅ Open WebUI (+ Recherche Internet) → port 8080"
 
-# ---- 4. Open Interpreter ----
-echo "📦 Installation Open Interpreter..."
-pip install open-interpreter --quiet --break-system-packages
-
-echo "⚙️  Configuration d'Open Interpreter avec le modèle : ${INTERPRETER_MODEL}"
+# ---- 5. Open Interpreter ----
+echo "📦 Configuration d'Open Interpreter avec le modèle : ${INTERPRETER_MODEL}"
 mkdir -p /root/.config/open-interpreter
 cat > /root/.config/open-interpreter/config.yaml << EOF
 model: ollama/${INTERPRETER_MODEL}
@@ -67,7 +75,7 @@ interpreter --server --port 8889 --host 0.0.0.0 \
   > /tmp/interpreter.log 2>&1 &
 echo "✅ Open Interpreter → port 8889"
 
-# ---- 5. Script ziggy-start.sh pour prochains redémarrages ----
+# ---- 6. Script ziggy-start.sh pour prochains redémarrages ----
 cat > /workspace/ziggy-start.sh << 'EOF'
 #!/bin/bash
 echo "🔄 Démarrage Ziggy AI..."
@@ -80,6 +88,8 @@ sleep 6
 
 DATA_DIR=/workspace/openwebui-data \
 OLLAMA_BASE_URL=http://localhost:11434 \
+ENABLE_RAG_WEB_SEARCH=True \
+RAG_WEB_SEARCH_ENGINE="duckduckgo" \
 open-webui serve --host 0.0.0.0 --port 8080 \
   > /workspace/openwebui.log 2>&1 &
 
@@ -87,7 +97,7 @@ interpreter --server --port 8889 --host 0.0.0.0 \
   > /tmp/interpreter.log 2>&1 &
 
 echo "============================================"
-echo " ✅ ZIGGY AI PRÊT"
+echo " ✅ ZIGGY AI PRÊT (WEB + OS + CREWAI)"
 echo "  🌐 Open WebUI    → port 8080"
 echo "  🧠 Interpreter   → port 8889"
 echo "  📓 JupyterLab    → port 8888"
