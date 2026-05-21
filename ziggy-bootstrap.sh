@@ -1,179 +1,115 @@
+cd /workspace && cat > ziggy-install.sh << 'ZIGGYEOF' && chmod +x ziggy-install.sh && bash ziggy-install.sh
 #!/bin/bash
 set -e
+
+wait_for_http() {
+  local url=$1; local name=$2; local timeout=${3:-180}; local elapsed=0
+  echo -n "⏳ Attente ${name}..."
+  while [ $elapsed -lt $timeout ]; do
+    local code=$(curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+    if [ "$code" = "200" ] || [ "$code" = "307" ] || [ "$code" = "404" ]; then
+      echo " ✅ (HTTP $code, ${elapsed}s)"; return 0
+    fi
+    sleep 3; elapsed=$((elapsed + 3)); echo -n "."
+  done
+  echo " ❌ TIMEOUT"; return 1
+}
+
 echo "============================================"
-echo " ZIGGY AI - BOOTSTRAP v3.1 (venv isolés)"
+echo " ZIGGY AI v5.1 - Bootstrap"
 echo "============================================"
 
-# ---- 0. Dépendances système ----
-echo "📦 Dépendances système..."
 apt-get update -qq
-apt-get install -y -qq lshw zstd curl wget pciutils python3-venv
+apt-get install -y -qq curl wget git python3-venv pciutils lsof
 
-# Cache pip et tmp sur Network Volume (évite disk full container)
-export PIP_CACHE_DIR=/workspace/pip-cache
-export TMPDIR=/workspace/tmp
-mkdir -p /workspace/pip-cache /workspace/tmp
+[ ! -f /usr/local/bin/cloudflared ] && \
+  curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && \
+  chmod +x /usr/local/bin/cloudflared
 
-# ---- 1. Ollama ----
-echo "📦 Installation Ollama..."
-if ! command -v ollama &> /dev/null; then
-    curl -fsSL https://ollama.ai/install.sh | sh
-fi
+command -v ollama &>/dev/null || curl -fsSL https://ollama.com/install.sh | sh
 mkdir -p /workspace/ollama-models /workspace/openwebui-data
-export OLLAMA_MODELS=/workspace/ollama-models
-pkill -f "ollama serve" 2>/dev/null || true
-sleep 2
-nohup ollama serve > /tmp/ollama.log 2>&1 &
-echo "⏳ Démarrage Ollama..." && sleep 8
+export OLLAMA_MODELS=/workspace/ollama-models OLLAMA_HOST=0.0.0.0
+pkill -f "ollama serve" 2>/dev/null || true; sleep 2
+nohup ollama serve > /workspace/ollama.log 2>&1 &
+wait_for_http "http://localhost:11434/api/tags" "Ollama" 30
 
-# ---- 2. Modèles selon VRAM ----
-echo "🧠 Détection VRAM..."
 VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo "0")
-echo "   VRAM détectée : ${VRAM} MB"
+if [ "$VRAM" -ge 70000 ]; then MODEL="qwen2.5:72b"
+elif [ "$VRAM" -ge 40000 ]; then MODEL="qwen2.5:32b"
+elif [ "$VRAM" -ge 20000 ]; then MODEL="qwen2.5:14b"
+else MODEL="qwen2.5:7b"; fi
+echo "🧠 VRAM ${VRAM} MB → pull ${MODEL}..."
+ollama pull "${MODEL}" || true
 
-INTERPRETER_MODEL="qwen2.5:7b"
-
-if [ "$VRAM" -ge 70000 ]; then
-  echo "→ GPU XXL : pull qwen2.5:72b + llama3.3:70b"
-  ollama pull qwen2.5:72b
-  ollama pull llama3.3:70b
-  INTERPRETER_MODEL="qwen2.5:72b"
-elif [ "$VRAM" -ge 40000 ]; then
-  echo "→ GPU XL : pull qwen2.5:32b + qwen2.5-coder:32b"
-  ollama pull qwen2.5:32b
-  ollama pull qwen2.5-coder:32b
-  INTERPRETER_MODEL="qwen2.5:32b"
-elif [ "$VRAM" -ge 20000 ]; then
-  echo "→ GPU L : pull qwen2.5:14b + mistral"
-  ollama pull qwen2.5:14b
-  ollama pull mistral
-  INTERPRETER_MODEL="qwen2.5:14b"
-else
-  echo "→ GPU M : pull qwen2.5:7b"
-  ollama pull qwen2.5:7b
-fi
-
-# ---- 3. Open WebUI dans son venv isolé ----
-echo "📦 Installation Open WebUI (venv isolé)..."
-if [ ! -d "/workspace/venv-openwebui" ]; then
+if [ ! -d /workspace/venv-openwebui ]; then
   python3 -m venv /workspace/venv-openwebui
-  /workspace/venv-openwebui/bin/pip install --upgrade pip --quiet
+  /workspace/venv-openwebui/bin/pip install --upgrade pip setuptools --quiet
   /workspace/venv-openwebui/bin/pip install --quiet open-webui
-else
-  echo "  → venv-openwebui déjà existant, skip install"
 fi
+pkill -f "open-webui serve" 2>/dev/null || true; sleep 2
+DATA_DIR=/workspace/openwebui-data OLLAMA_BASE_URL=http://localhost:11434 \
+  nohup /workspace/venv-openwebui/bin/open-webui serve --host 0.0.0.0 --port 7860 > /workspace/openwebui.log 2>&1 &
+wait_for_http "http://localhost:7860" "Open WebUI" 300
 
-# Lancer Open WebUI
-pkill -f "open-webui" 2>/dev/null || true
-sleep 2
-DATA_DIR=/workspace/openwebui-data \
-OLLAMA_BASE_URL=http://localhost:11434 \
-ENABLE_RAG_WEB_SEARCH=True \
-RAG_WEB_SEARCH_ENGINE=duckduckgo \
-nohup /workspace/venv-openwebui/bin/open-webui serve --host 0.0.0.0 --port 8080 \
-  > /workspace/openwebui.log 2>&1 &
-echo "✅ Open WebUI → port 8080 (démarrage en cours, 60-90 sec)"
-
-# ---- 4. Open Interpreter dans son venv isolé ----
-echo "📦 Installation Open Interpreter (venv isolé)..."
-if [ ! -d "/workspace/venv-interpreter" ]; then
+if [ ! -d /workspace/venv-interpreter ]; then
   python3 -m venv /workspace/venv-interpreter
-  /workspace/venv-interpreter/bin/pip install --upgrade pip --quiet
-  # FIX: setuptools manque dans Python 3.12 venv mais open-interpreter en a besoin (pkg_resources)
-  /workspace/venv-interpreter/bin/pip install --quiet setuptools
+  /workspace/venv-interpreter/bin/pip install --upgrade pip setuptools --quiet
   /workspace/venv-interpreter/bin/pip install --quiet open-interpreter
-else
-  echo "  → venv-interpreter déjà existant, skip install"
 fi
+/workspace/venv-interpreter/bin/pip install --upgrade --quiet setuptools
 
-# Config Open Interpreter
 mkdir -p /root/.config/open-interpreter
 cat > /root/.config/open-interpreter/config.yaml << EOF
-model: ollama/${INTERPRETER_MODEL}
+model: ollama/${MODEL}
 api_base: http://localhost:11434
 context_window: 8000
 max_tokens: 4096
 offline: true
 safe_mode: off
+auto_run: true
 EOF
 
-# Lancer Open Interpreter API
-pkill -f "interpreter --server" 2>/dev/null || true
-sleep 2
-nohup /workspace/venv-interpreter/bin/interpreter \
-  --server --host 0.0.0.0 --port 8889 \
-  > /workspace/interpreter.log 2>&1 &
-echo "✅ Open Interpreter → port 8889 (modèle: ${INTERPRETER_MODEL})"
+pkill -f "interpreter --server" 2>/dev/null || true; sleep 2
+nohup /workspace/venv-interpreter/bin/interpreter --server --host 0.0.0.0 --port 8000 > /workspace/interpreter.log 2>&1 &
+wait_for_http "http://localhost:8000/v1/models" "Interpreter" 60 || echo "⚠️ Interpreter KO, check /workspace/interpreter.log"
 
-# ---- 5. Génère ziggy-start.sh pour relance rapide ----
-cat > /workspace/ziggy-start.sh << 'STARTEOF'
+pkill -f "cloudflared tunnel" 2>/dev/null || true; sleep 2
+nohup cloudflared tunnel --url http://localhost:7860 > /workspace/tunnel.log 2>&1 &
+echo -n "⏳ Attente URL Cloudflare..."
+for i in {1..30}; do
+  PUBLIC_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /workspace/tunnel.log 2>/dev/null | head -1)
+  [ -n "$PUBLIC_URL" ] && break
+  sleep 2; echo -n "."
+done
+echo ""
+
+cat > /workspace/ziggy-url.sh << 'URLEOF'
 #!/bin/bash
-echo "🔄 Démarrage Ziggy AI..."
-export OLLAMA_MODELS=/workspace/ollama-models
-export PIP_CACHE_DIR=/workspace/pip-cache
-export TMPDIR=/workspace/tmp
+URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /workspace/tunnel.log 2>/dev/null | head -1)
+[ -z "$URL" ] && echo "❌ Pas d'URL — relance bash /workspace/ziggy-start.sh" || echo "🌐 ${URL}"
+URLEOF
+chmod +x /workspace/ziggy-url.sh
 
-# Stop tout
-pkill -f ollama 2>/dev/null
-pkill -f open-webui 2>/dev/null
-pkill -f "interpreter --server" 2>/dev/null
-sleep 3
-
-# Ollama
-nohup ollama serve > /tmp/ollama.log 2>&1 &
-sleep 8
-
-# Open WebUI
-DATA_DIR=/workspace/openwebui-data \
-OLLAMA_BASE_URL=http://localhost:11434 \
-ENABLE_RAG_WEB_SEARCH=True \
-RAG_WEB_SEARCH_ENGINE=duckduckgo \
-nohup /workspace/venv-openwebui/bin/open-webui serve --host 0.0.0.0 --port 8080 \
-  > /workspace/openwebui.log 2>&1 &
-
-# Open Interpreter
-nohup /workspace/venv-interpreter/bin/interpreter --server --host 0.0.0.0 --port 8889 \
-  > /workspace/interpreter.log 2>&1 &
-
-echo "⏳ Démarrage en cours (60 sec)..."
-sleep 60
+cat > /workspace/ziggy-status.sh << 'STATEOF'
+#!/bin/bash
+echo "============================================"
+ps aux | grep -E "ollama serve|open-webui|interpreter --server|cloudflared tunnel" | grep -v grep | awk '{print "  ✓", $11, $12, $13}'
+echo ""
+curl -s -o /dev/null -w "  WebUI       : HTTP %{http_code}\n" http://localhost:7860 || echo "  WebUI : OFF"
+curl -s -o /dev/null -w "  Interpreter : HTTP %{http_code}\n" http://localhost:8000/v1/models || echo "  Interpreter : OFF"
+curl -s -o /dev/null -w "  Ollama      : HTTP %{http_code}\n" http://localhost:11434/api/tags || echo "  Ollama : OFF"
+URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /workspace/tunnel.log 2>/dev/null | head -1)
+[ -n "$URL" ] && echo "  🌐 URL      : $URL"
+echo "============================================"
+STATEOF
+chmod +x /workspace/ziggy-status.sh
 
 echo ""
 echo "============================================"
-echo " ✅ ZIGGY AI PRÊT"
-echo "  🌐 Open WebUI    → port 8080"
-echo "  🧠 Interpreter   → port 8889"
-echo "  📓 JupyterLab    → port 8888"
+echo " ✅ INSTALLATION TERMINÉE"
 echo "============================================"
-echo ""
-echo "=== Statut services ==="
-curl -s -o /dev/null -w "Open WebUI : HTTP %{http_code}\n" http://localhost:8080
-curl -s -o /dev/null -w "Interpreter: HTTP %{http_code}\n" http://localhost:8889
-curl -s -o /dev/null -w "Ollama API : HTTP %{http_code}\n" http://localhost:11434/api/tags
-STARTEOF
-chmod +x /workspace/ziggy-start.sh
-echo "✅ ziggy-start.sh créé pour relance rapide"
-
-# ---- 6. Récap final ----
-echo ""
-echo "⏳ Attente démarrage complet des services (60 sec)..."
-sleep 60
-
-echo ""
+echo "  🌐 URL PUBLIQUE  : ${PUBLIC_URL}"
+echo "  🧠 Modèle        : ${MODEL}"
 echo "============================================"
-echo " ✅ BOOTSTRAP TERMINÉ !"
-echo "============================================"
-echo "  🌐 Open WebUI    → port 8080"
-echo "  🧠 Interpreter   → port 8889"
-echo "  📓 JupyterLab    → port 8888"
-echo ""
-echo "  ⚠️  Vérifie que les ports 8080 et 8889 sont exposés dans RunPod"
-echo "  🔄 Prochain pod  → bash /workspace/ziggy-start.sh"
-echo ""
-echo "=== Statut services ==="
-curl -s -o /dev/null -w "Open WebUI : HTTP %{http_code}\n" http://localhost:8080
-curl -s -o /dev/null -w "Interpreter: HTTP %{http_code}\n" http://localhost:8889
-curl -s -o /dev/null -w "Ollama API : HTTP %{http_code}\n" http://localhost:11434/api/tags
-echo ""
-echo "  ✅ HTTP 200 = OK, va sur RunPod → Connect → Port 8080"
-echo "============================================"
+bash /workspace/ziggy-status.sh
+ZIGGYEOF
